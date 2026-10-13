@@ -15,6 +15,17 @@ runs:
         echo "WOPEE_SCREENSHOT_VALIDATION_ENABLED=${WOPEE_SCREENSHOT_VALIDATION_ENABLED:-true}" >> $GITHUB_ENV
         echo "WOPEE_COLLECT_PAGE_CONTENT=${WOPEE_COLLECT_PAGE_CONTENT:-true}" >> $GITHUB_ENV
 
+    # The repo's .env first, the dispatch payload second: a later line wins, so Commander's values override.
+    - name: Load .github/workflows/.env → $GITHUB_ENV
+      shell: bash
+      run: |
+        if [ -f .github/workflows/.env ]; then
+          # Extract valid KEY=VALUE lines; if none are found, skip without failing the step
+          grep -vE '^(#|$)' .github/workflows/.env | \
+            grep -E '^[A-Za-z_][A-Za-z0-9_]*=' \
+            >> "$GITHUB_ENV" || true
+        fi
+
     - name: Load client_payload.env → $GITHUB_ENV
       if: github.event.client_payload.env
       shell: bash
@@ -29,59 +40,54 @@ runs:
             end
         ' "$GITHUB_EVENT_PATH" >> "$GITHUB_ENV"
 
-    - name: Load .github/workflows/.env → $GITHUB_ENV
-      shell: bash
-      run: |
-        if [ -f .github/workflows/.env ]; then
-          # Extract valid KEY=VALUE lines; if none are found, skip without failing the step
-          grep -vE '^(#|$)' .github/workflows/.env | \
-            grep -E '^[A-Za-z_][A-Za-z0-9_]*=' \
-            >> "$GITHUB_ENV" || true
-        fi
-
     - name: Run tests
+      id: tests
       shell: bash
       run: |
           npm install --prefer-offline --no-audit
           npm test
 
     - name: Confirm end of run
-      if: always()
+      if: always() && github.event.action == 'code'
       shell: bash
       run: |
+        if [ -z "${WOPEE_SUITE_UUID:-}" ]; then
+          echo "No WOPEE_SUITE_UUID - nothing to confirm"
+          exit 0
+        fi
 
         ERROR_FLAG=false
-        if [ "${{ job.status }}" = "failure" ]; then
+        if [ "${{ steps.tests.outcome }}" != "success" ]; then
           ERROR_FLAG=true
         fi
 
-        if [ "${{ github.event.action }}" = "code" ]; then
+        IDENTIFIER=""
+        if [ -n "${WOPEE_USER_STORY_ID:-}" ] && [ -n "${WOPEE_TEST_CASE_ID:-}" ]; then
+          IDENTIFIER="${WOPEE_USER_STORY_ID}:${WOPEE_TEST_CASE_ID}"
+        fi
 
-          JSON_PAYLOAD=$(cat <<-EOF
-          {
-            "query": "mutation PostProcessAgentSuite(\$input: PostProcessAgentSuiteInput!) { postProcessAgentSuite(input: \$input) }",
-            "variables": {
-              "input": {
-                "error": $ERROR_FLAG,
-                "projectUuid": "${{ env.WOPEE_PROJECT_UUID }}",
-                "suiteUuid": "${{ env.WOPEE_SUITE_UUID }}",
-                "testCase": {
-                  "testCaseId": "${{ env.WOPEE_TEST_CASE_ID }}",
-                  "userStoryId": "${{ env.WOPEE_USER_STORY_ID }}"
-                }
-              }
+        JSON_PAYLOAD=$(cat <<-EOF
+        {
+          "query": "mutation PostProcessAgentSuite(\$input: PostProcessAgentSuiteInput!) { postProcessAgentSuite(input: \$input) { postProcessing errorMessage } }",
+          "variables": {
+            "input": {
+              "error": $ERROR_FLAG,
+              "projectUuid": "${WOPEE_PROJECT_UUID}",
+              "suiteUuid": "${WOPEE_SUITE_UUID}",
+              "identifier": "$IDENTIFIER"
             }
           }
+        }
         EOF
-          )
-        fi
+        )
 
         curl --request POST \
           --header 'content-type: application/json' \
-          --header 'api_key: ${{ env.WOPEE_API_KEY }}' \
-          --url '${{ env.WOPEE_API_URL }}' \
+          --header "api_key: ${WOPEE_API_KEY}" \
+          --header "x-api-key: ${WOPEE_API_KEY}" \
+          --url "${WOPEE_API_URL}" \
           --data "$JSON_PAYLOAD"
-          
+
     - name: Upload test results
       if: always()
       uses: actions/upload-artifact@v4
@@ -89,4 +95,5 @@ runs:
         name: webdriverio-results
         path: |
           wdio-reports
+        if-no-files-found: ignore
         retention-days: 1
